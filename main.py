@@ -400,7 +400,7 @@ def main():
     MODEL_NAME = 'yolov8n.pt'  # Modello leggero e veloce
     VIDEOS_FOLDER = 'videos'
     OUTPUT_FOLDER = 'output'
-    SAVE_OUTPUT_VIDEOS = False  # Imposta True per salvare i video annotati
+    SAVE_OUTPUT_VIDEOS = True  # Imposta True per salvare i video annotati
 
     # Crea l'istanza del detector
     detector = VideoObjectDetection(
