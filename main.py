@@ -10,14 +10,7 @@ import matplotlib.pyplot as plt
 
 class VideoObjectDetection:
     def __init__(self, model_name='yolov8n.pt', videos_folder='videos', output_folder='output'):
-        """
-        Inizializza il sistema di object detection
 
-        Args:
-            model_name: Nome del modello YOLO da utilizzare
-            videos_folder: Cartella contenente i video da processare
-            output_folder: Cartella per salvare i risultati
-        """
         self.model_name = model_name
         self.videos_folder = Path(videos_folder)
         self.output_folder = Path(output_folder)
@@ -29,7 +22,6 @@ class VideoObjectDetection:
         print("Modello caricato con successo!")
 
     def get_video_files(self):
-        """Ottiene tutti i file video dalla cartella"""
         video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv']
         video_files = []
 
@@ -43,16 +35,6 @@ class VideoObjectDetection:
         return list(video_files)
 
     def process_video_sequential(self, video_path, save_output=False):
-        """
-        Elabora un singolo video in modo sequenziale
-
-        Args:
-            video_path: Path del video da processare
-            save_output: Se True, salva il video con le detection
-
-        Returns:
-            Dizionario con statistiche di elaborazione
-        """
         cap = cv2.VideoCapture(str(video_path))
 
         if not cap.isOpened():
@@ -151,10 +133,6 @@ class VideoObjectDetection:
 
     @staticmethod
     def process_video_worker(args):
-        """
-        Worker function per il processing parallelo
-        Deve essere statico per funzionare con multiprocessing
-        """
         video_path, model_name, output_folder, save_output = args
 
         # Ogni processo carica il proprio modello
@@ -218,13 +196,6 @@ class VideoObjectDetection:
         return stats
 
     def process_all_videos_parallel(self, save_output=False, num_processes=None):
-        """
-        Elabora tutti i video in parallelo usando multiprocessing
-
-        Args:
-            save_output: Se True, salva i video con le detection
-            num_processes: Numero di processi (None = cpu_count)
-        """
         video_files = self.get_video_files()
 
         if not video_files:
@@ -397,7 +368,7 @@ def main():
     print("=" * 80)
 
     # Configurazione
-    MODEL_NAME = 'yolov8n.pt'  # Modello leggero e veloce
+    MODEL_NAME = 'yolov8n.pt'
     VIDEOS_FOLDER = 'videos'
     OUTPUT_FOLDER = 'output'
     SAVE_OUTPUT_VIDEOS = True  # Imposta True per salvare i video annotati
