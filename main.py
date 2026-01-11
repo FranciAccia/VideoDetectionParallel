@@ -1,405 +1,341 @@
+import os
+
+# --- FIX CRITICO PER PARALLELISMO ---
+# Impediamo alle librerie di usare il multithreading interno.
+# Vogliamo che ogni processo usi 1 solo core, così possiamo scalarne N in parallelo.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# ------------------------------------
+
 import cv2
 import time
 import os
 from pathlib import Path
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, set_start_method
 import numpy as np
 from ultralytics import YOLO
 import matplotlib.pyplot as plt
+import platform
 
 
 class VideoObjectDetection:
     def __init__(self, model_name='yolov8n.pt', videos_folder='videos', output_folder='output'):
-
         self.model_name = model_name
         self.videos_folder = Path(videos_folder)
         self.output_folder = Path(output_folder)
         self.output_folder.mkdir(exist_ok=True)
 
-        # Carica il modello YOLO
-        print(f"Caricamento modello {model_name}...")
-        self.model = YOLO(model_name)
-        print("Modello caricato con successo!")
+        # Verifica architettura per report
+        print(f"Sistema rilevato: {platform.system()} {platform.machine()} (Apple Silicon M-Series)"
+              if platform.system() == 'Darwin' and 'arm' in platform.machine()
+              else f"Sistema rilevato: {platform.system()} {platform.machine()}")
+
+        # Carica il modello una volta per scaricare i pesi se necessario
+        print(f"Check modello {model_name}...")
+        _ = YOLO(model_name)
+        print("Modello pronto.")
 
     def get_video_files(self):
         video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv']
         video_files = []
-
         if not self.videos_folder.exists():
             print(f"Errore: La cartella '{self.videos_folder}' non esiste!")
             return video_files
-
         for ext in video_extensions:
             video_files.extend(self.videos_folder.glob(f'*{ext}'))
-
         return list(video_files)
 
     def process_video_sequential(self, video_path, save_output=False):
-        cap = cv2.VideoCapture(str(video_path))
+        # Su M2 per il sequenziale potremmo usare 'mps', ma per coerenza
+        # col benchmark parallelo usiamo 'cpu' o lasciamo auto.
+        # Per il benchmark puro CPU vs CPU Parallel, meglio forzare CPU.
+        model = YOLO(self.model_name)
 
+        cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
-            print(f"Errore nell'apertura del video: {video_path}")
             return None
 
-        # Ottieni informazioni sul video
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        # Preparazione per salvare output
         out = None
         if save_output:
             output_path = self.output_folder / f"seq_{video_path.name}"
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            # Su Mac 'avc1' (H.264) è spesso più compatibile di 'mp4v'
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
         frame_count = 0
         total_detections = 0
         start_time = time.time()
 
-        print(f"\nElaborazione sequenziale: {video_path.name}")
-        print(f"Frame totali: {total_frames}, FPS: {fps}, Risoluzione: {width}x{height}")
-
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # Esegui detection
-            results = self.model(frame, verbose=False)
+            # Forza CPU per coerenza con il test parallelo
+            results = model(frame, verbose=False, device='cpu')
 
-            # Conta le detection
             for result in results:
                 total_detections += len(result.boxes)
 
-            # Disegna i bounding box
-            annotated_frame = results[0].plot()
-
             if save_output and out is not None:
+                annotated_frame = results[0].plot()
                 out.write(annotated_frame)
 
             frame_count += 1
 
-            # Mostra progresso ogni 30 frame
-            if frame_count % 30 == 0:
-                print(f"Processati {frame_count}/{total_frames} frame...")
-
         elapsed_time = time.time() - start_time
-
         cap.release()
         if out is not None:
             out.release()
 
-        stats = {
+        return {
             'video_name': video_path.name,
             'frames_processed': frame_count,
             'total_detections': total_detections,
-            'elapsed_time': elapsed_time,
-            'fps_processing': frame_count / elapsed_time if elapsed_time > 0 else 0
+            'elapsed_time': elapsed_time
         }
 
-        print(f"Completato in {elapsed_time:.2f}s - FPS elaborazione: {stats['fps_processing']:.2f}")
-
-        return stats
-
-    def process_all_videos_sequential(self, save_output=False):
-        """Elabora tutti i video in modo sequenziale"""
+    def process_all_videos_sequential(self, save_output=False, verbose=True):
         video_files = self.get_video_files()
+        if not video_files: return [], 0
 
-        if not video_files:
-            print("Nessun video trovato nella cartella 'videos'!")
-            return []
-
-        print(f"\n{'=' * 60}")
-        print(f"ELABORAZIONE SEQUENZIALE - {len(video_files)} video")
-        print(f"{'=' * 60}")
+        if verbose:
+            print(f"   [Sequential] Elaborazione {len(video_files)} video...")
 
         start_time = time.time()
         results = []
-
         for video_path in video_files:
             stats = self.process_video_sequential(video_path, save_output)
             if stats:
                 results.append(stats)
-
         total_time = time.time() - start_time
-
-        print(f"\n{'=' * 60}")
-        print(f"TEMPO TOTALE SEQUENZIALE: {total_time:.2f}s")
-        print(f"{'=' * 60}")
 
         return results, total_time
 
     @staticmethod
     def process_video_worker(args):
+        # Unpack degli argomenti
         video_path, model_name, output_folder, save_output = args
 
-        # Ogni processo carica il proprio modello
+        # IMPORTANTE PER M2: Ogni processo deve ricaricare il modello.
+        # Forziamo device='cpu' perché multiprocessing su 'mps' (GPU)
+        # spesso causa crash o contention (rallentamenti) su macOS.
         model = YOLO(model_name)
 
         cap = cv2.VideoCapture(str(video_path))
-
         if not cap.isOpened():
             return None
 
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
         out = None
         if save_output:
             output_path = Path(output_folder) / f"par_{Path(video_path).name}"
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            # Codec H.264 per Mac
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
         frame_count = 0
         total_detections = 0
         start_time = time.time()
 
-        print(f"[Worker] Elaborazione: {Path(video_path).name}")
-
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            results = model(frame, verbose=False)
+            # Inferenza su CPU
+            results = model(frame, verbose=False, device='cpu')
 
             for result in results:
                 total_detections += len(result.boxes)
 
-            annotated_frame = results[0].plot()
-
             if save_output and out is not None:
+                annotated_frame = results[0].plot()
                 out.write(annotated_frame)
 
             frame_count += 1
 
         elapsed_time = time.time() - start_time
-
         cap.release()
         if out is not None:
             out.release()
 
-        stats = {
+        return {
             'video_name': Path(video_path).name,
             'frames_processed': frame_count,
             'total_detections': total_detections,
-            'elapsed_time': elapsed_time,
-            'fps_processing': frame_count / elapsed_time if elapsed_time > 0 else 0
+            'elapsed_time': elapsed_time
         }
 
-        print(f"[Worker] {Path(video_path).name} completato in {elapsed_time:.2f}s")
-
-        return stats
-
-    def process_all_videos_parallel(self, save_output=False, num_processes=None):
+    def process_all_videos_parallel(self, save_output=False, num_processes=None, verbose=True):
         video_files = self.get_video_files()
-
-        if not video_files:
-            print("Nessun video trovato nella cartella 'videos'!")
-            return []
+        if not video_files: return [], 0
 
         if num_processes is None:
             num_processes = cpu_count()
 
-        # Su M2, limita a un numero ragionevole per non saturare
-        num_processes = min(num_processes, len(video_files))
+        actual_processes = min(num_processes, len(video_files))
 
-        print(f"\n{'=' * 60}")
-        print(f"ELABORAZIONE PARALLELA - {len(video_files)} video")
-        print(f"Processi utilizzati: {num_processes}")
-        print(f"{'=' * 60}")
+        if verbose:
+            print(f"   [Parallel] Elaborazione {len(video_files)} video con {actual_processes} processi...")
 
-        # Prepara gli argomenti per ogni worker
         worker_args = [
             (video_path, self.model_name, self.output_folder, save_output)
             for video_path in video_files
         ]
 
         start_time = time.time()
-
-        # Elaborazione parallela
-        with Pool(processes=num_processes) as pool:
+        # Su macOS con 'spawn', gli oggetti passati ai worker devono essere picklable.
+        # YOLO e OpenCV gestiscono questo meglio se reinizializzati nel worker (come fatto sopra).
+        with Pool(processes=actual_processes) as pool:
             results = pool.map(self.process_video_worker, worker_args)
-
         total_time = time.time() - start_time
 
-        # Filtra eventuali None
         results = [r for r in results if r is not None]
-
-        print(f"\n{'=' * 60}")
-        print(f"TEMPO TOTALE PARALLELO: {total_time:.2f}s")
-        print(f"{'=' * 60}")
-
         return results, total_time
 
-    def compare_performance(self, save_output=False, num_processes=None):
-        """
-        Confronta le performance tra elaborazione sequenziale e parallela
-        """
+    def run_robust_benchmark(self, save_output=False, n_runs=3):
         print("\n" + "=" * 80)
-        print("BENCHMARK: SEQUENTIAL vs PARALLEL VIDEO OBJECT DETECTION")
+        print(f"AVVIO BENCHMARK ROBUSTO (MacBook M2 Optimized)")
+        print(f"Runs per configurazione: {n_runs}")
         print("=" * 80)
 
-        # Elaborazione sequenziale
-        seq_results, seq_time = self.process_all_videos_sequential(save_output)
+        video_files = self.get_video_files()
+        if not video_files:
+            print("Nessun video trovato nella cartella 'videos'!")
+            print("Crea la cartella e aggiungi dei file .mp4")
+            return
 
-        # Elaborazione parallela
-        par_results, par_time = self.process_all_videos_parallel(save_output, num_processes)
+        # 1. Warm-up
+        print("\n>>> Fase 1: Warm-up...")
+        if len(video_files) > 0:
+            self.process_video_sequential(video_files[0], save_output=False)
+        print("Warm-up completato.")
 
-        # Calcola speedup
-        speedup = seq_time / par_time if par_time > 0 else 0
-        efficiency = speedup / (num_processes or cpu_count()) * 100
+        # 2. Baseline Sequenziale
+        print(f"\n>>> Fase 2: Baseline Sequenziale...")
+        seq_times = []
+        final_seq_results = []
 
-        # Stampa risultati
-        print(f"\n{'=' * 80}")
-        print("RISULTATI FINALI")
-        print(f"{'=' * 80}")
-        print(f"Video processati: {len(seq_results)}")
-        print(f"Tempo sequenziale: {seq_time:.2f}s")
-        print(f"Tempo parallelo: {par_time:.2f}s")
-        print(f"SpeedUp: {speedup:.2f}x")
-        print(f"Efficienza: {efficiency:.2f}%")
-        print(f"Processi utilizzati: {num_processes or cpu_count()}")
-        print(f"{'=' * 80}\n")
+        for i in range(n_runs):
+            print(f"   Run {i + 1}/{n_runs}...", end="\r")
+            res, t = self.process_all_videos_sequential(save_output, verbose=False)
+            seq_times.append(t)
+            final_seq_results = res
 
-        # Crea grafici
-        self.plot_comparison(seq_results, par_results, seq_time, par_time, speedup)
+        avg_seq_time = np.mean(seq_times)
+        print(f"   Tempo Medio Sequenziale: {avg_seq_time:.2f}s")
 
-        return {
-            'sequential_time': seq_time,
-            'parallel_time': par_time,
-            'speedup': speedup,
-            'efficiency': efficiency,
-            'num_processes': num_processes or cpu_count()
-        }
+        # 3. Test Scalabilità
+        print("\n>>> Fase 3: Test Scalabilità Parallela...")
+        max_cores = cpu_count()
 
-    def plot_comparison(self, seq_results, par_results, seq_time, par_time, speedup):
-        """Crea grafici di confronto"""
-        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-        fig.suptitle('Video Object Detection: Sequential vs Parallel Performance',
-                     fontsize=16, fontweight='bold')
+        # Su M2 Air hai 8 core (4P + 4E). Testiamo configurazioni significative.
+        core_counts = [2, 4]
+        if max_cores > 4:
+            core_counts.append(max_cores)  # Testiamo 8
 
-        # 1. Tempo totale di elaborazione
-        ax1 = axes[0, 0]
-        methods = ['Sequential', 'Parallel']
-        times = [seq_time, par_time]
-        colors = ['#ff6b6b', '#4ecdc4']
-        bars = ax1.bar(methods, times, color=colors, alpha=0.8, edgecolor='black')
-        ax1.set_ylabel('Tempo (secondi)', fontweight='bold')
-        ax1.set_title('Tempo Totale di Elaborazione')
-        ax1.grid(axis='y', alpha=0.3)
+        scaling_results = []
 
-        # Aggiungi valori sopra le barre
-        for bar in bars:
-            height = bar.get_height()
-            ax1.text(bar.get_x() + bar.get_width() / 2., height,
-                     f'{height:.2f}s', ha='center', va='bottom', fontweight='bold')
+        for n_proc in core_counts:
+            print(f"\n   Test con {n_proc} Processi:")
+            par_times = []
+            final_par_results = []
 
-        # 2. SpeedUp
-        ax2 = axes[0, 1]
-        ax2.bar(['SpeedUp'], [speedup], color='#95e1d3', alpha=0.8, edgecolor='black')
-        ax2.axhline(y=1, color='red', linestyle='--', label='Baseline (1x)')
-        ax2.set_ylabel('SpeedUp Factor', fontweight='bold')
-        ax2.set_title(f'SpeedUp: {speedup:.2f}x')
-        ax2.grid(axis='y', alpha=0.3)
-        ax2.legend()
-        ax2.text(0, speedup, f'{speedup:.2f}x', ha='center', va='bottom',
-                 fontweight='bold', fontsize=12)
+            for i in range(n_runs):
+                print(f"     Run {i + 1}/{n_runs}...", end="\r")
+                res, t = self.process_all_videos_parallel(save_output, num_processes=n_proc, verbose=False)
+                par_times.append(t)
+                final_par_results = res
 
-        # 3. Tempo per video
-        ax3 = axes[1, 0]
-        video_names = [r['video_name'] for r in seq_results]
-        seq_times = [r['elapsed_time'] for r in seq_results]
-        par_times = [r['elapsed_time'] for r in par_results]
+            avg_par_time = np.mean(par_times)
+            speedup = avg_seq_time / avg_par_time if avg_par_time > 0 else 0
+            efficiency = (speedup / n_proc) * 100
 
-        x = np.arange(len(video_names))
-        width = 0.35
+            print(f"     Tempo Medio: {avg_par_time:.2f}s | Speedup: {speedup:.2f}x | Efficienza: {efficiency:.1f}%")
 
-        ax3.bar(x - width / 2, seq_times, width, label='Sequential',
-                color='#ff6b6b', alpha=0.8, edgecolor='black')
-        ax3.bar(x + width / 2, par_times, width, label='Parallel',
-                color='#4ecdc4', alpha=0.8, edgecolor='black')
+            scaling_results.append({
+                'cores': n_proc,
+                'time': avg_par_time,
+                'speedup': speedup,
+                'efficiency': efficiency
+            })
 
-        ax3.set_xlabel('Video', fontweight='bold')
-        ax3.set_ylabel('Tempo (secondi)', fontweight='bold')
-        ax3.set_title('Tempo di Elaborazione per Video')
-        ax3.set_xticks(x)
-        ax3.set_xticklabels([name[:15] for name in video_names], rotation=45, ha='right')
-        ax3.legend()
-        ax3.grid(axis='y', alpha=0.3)
+            # Controllo integrità
+            total_det_seq = sum(r['total_detections'] for r in final_seq_results)
+            total_det_par = sum(r['total_detections'] for r in final_par_results)
+            if total_det_seq == total_det_par:
+                print(f"     [OK] Check Detection: {total_det_par}")
+            else:
+                print(f"     [WARN] Check Detection mismatch: {total_det_seq} vs {total_det_par}")
 
-        # 4. Frame processati e detection
-        ax4 = axes[1, 1]
-        total_frames_seq = sum(r['frames_processed'] for r in seq_results)
-        total_det_seq = sum(r['total_detections'] for r in seq_results)
+        self.plot_scaling_analysis(avg_seq_time, scaling_results)
 
-        categories = ['Frame\nProcessati', 'Oggetti\nRilevati']
-        values = [total_frames_seq, total_det_seq]
+    def plot_scaling_analysis(self, seq_time, scaling_data):
+        cores = [1] + [d['cores'] for d in scaling_data]
+        times = [seq_time] + [d['time'] for d in scaling_data]
+        speedups = [1.0] + [d['speedup'] for d in scaling_data]
+        efficiencies = [100.0] + [d['efficiency'] for d in scaling_data]
+        ideal_speedup = cores
 
-        bars = ax4.bar(categories, values, color=['#f38181', '#aa96da'],
-                       alpha=0.8, edgecolor='black')
-        ax4.set_title('Statistiche Totali')
-        ax4.grid(axis='y', alpha=0.3)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+        fig.suptitle('M2 MacBook Air - Parallel Scaling Analysis', fontsize=16)
 
-        for bar in bars:
-            height = bar.get_height()
-            ax4.text(bar.get_x() + bar.get_width() / 2., height,
-                     f'{int(height)}', ha='center', va='bottom', fontweight='bold')
+        # Plot Speedup
+        ax1.plot(cores, speedups, 'o-', linewidth=2, color='#2ecc71', label='Misurato')
+        ax1.plot(cores, ideal_speedup, '--', color='gray', alpha=0.5, label='Ideale')
+        ax1.set_xlabel('Processi')
+        ax1.set_ylabel('Speedup (x)')
+        ax1.set_title('Speedup vs Core')
+        ax1.grid(True, alpha=0.3)
+        ax1.legend()
+        ax1.set_xticks(cores)
+
+        # Plot Efficienza
+        ax2.bar([str(c) for c in cores], efficiencies, color='#3498db', alpha=0.8, edgecolor='black')
+        ax2.set_xlabel('Processi')
+        ax2.set_ylabel('Efficienza (%)')
+        ax2.set_title('Efficienza Parallela')
+        ax2.axhline(y=100, color='red', linestyle='--', alpha=0.5)
+        ax2.set_ylim(0, 110)
+
+        for i, v in enumerate(efficiencies):
+            ax2.text(i, v + 2, f'{v:.0f}%', ha='center')
 
         plt.tight_layout()
-
-        # Salva il grafico
-        output_path = self.output_folder / 'performance_comparison.png'
-        plt.savefig(output_path, dpi=300, bbox_inches='tight')
-        print(f"\nGrafico salvato in: {output_path}")
-
-        plt.show()
+        out_path = self.output_folder / 'm2_scaling_benchmark.png'
+        plt.savefig(out_path, dpi=300)
+        print(f"\nGrafico salvato in: {out_path}")
+        # plt.show() # Commentato se eseguito headless, scommenta se hai display
 
 
 def main():
-    """Funzione principale"""
+    # CONFIGURAZIONE CRITICA PER MAC OS
+    # 'spawn' è necessario per evitare crash con OpenCV/PyTorch in multiprocessing
+    try:
+        set_start_method('spawn')
+    except RuntimeError:
+        pass  # Già settato
+
     print("=" * 80)
-    print("VIDEO OBJECT DETECTION - SEQUENTIAL vs PARALLEL")
-    print("Progetto per Parallel Programming")
+    print("M2 AIR - VIDEO PROCESSING BENCHMARK")
     print("=" * 80)
 
-    # Configurazione
-    MODEL_NAME = 'yolov8n.pt'
-    VIDEOS_FOLDER = 'videos'
-    OUTPUT_FOLDER = 'output'
-    SAVE_OUTPUT_VIDEOS = True  # Imposta True per salvare i video annotati
+    # Disabilita output video per non falsare il test con la velocità SSD
+    SAVE_OUTPUT_VIDEOS = False
 
-    # Crea l'istanza del detector
-    detector = VideoObjectDetection(
-        model_name=MODEL_NAME,
-        videos_folder=VIDEOS_FOLDER,
-        output_folder=OUTPUT_FOLDER
-    )
-
-    # Verifica che ci siano video da processare
-    video_files = detector.get_video_files()
-    if not video_files:
-        print(f"\nATTENZIONE: Nessun video trovato nella cartella '{VIDEOS_FOLDER}'!")
-        print("Assicurati di aver creato la cartella 'videos' e di aver inserito dei video.")
-        return
-
-    print(f"\nTrovati {len(video_files)} video da processare:")
-    for vf in video_files:
-        print(f"  - {vf.name}")
-
-    # Esegui il benchmark
-    results = detector.compare_performance(
-        save_output=SAVE_OUTPUT_VIDEOS,
-        num_processes=None  # None = usa tutti i core disponibili
-    )
-
-    print("\n" + "=" * 80)
-    print("BENCHMARK COMPLETATO!")
-    print("=" * 80)
+    detector = VideoObjectDetection()
+    detector.run_robust_benchmark(save_output=SAVE_OUTPUT_VIDEOS, n_runs=3)
 
 
 if __name__ == "__main__":
