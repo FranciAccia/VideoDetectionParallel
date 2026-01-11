@@ -1,17 +1,18 @@
 import os
-# Vogliamo che ogni processo usi 1 solo core, così possiamo scalarne N in parallelo.
+
+# Tentativo preventivo di limitare i thread per il processo principale
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
+# ------------------------------
+
 import cv2
 import time
-import os
 from pathlib import Path
 from multiprocessing import Pool, cpu_count, set_start_method
 import numpy as np
-from ultralytics import YOLO
 import matplotlib.pyplot as plt
 import platform
 
@@ -22,6 +23,9 @@ class VideoObjectDetection:
         self.videos_folder = Path(videos_folder)
         self.output_folder = Path(output_folder)
         self.output_folder.mkdir(exist_ok=True)
+
+        # Import locale per il processo principale
+        from ultralytics import YOLO
 
         # Verifica architettura per report
         print(f"Sistema rilevato: {platform.system()} {platform.machine()}"
@@ -44,6 +48,11 @@ class VideoObjectDetection:
         return list(video_files)
 
     def process_video_sequential(self, video_path, save_output=False):
+        # Import locale
+        from ultralytics import YOLO
+
+        # Nel sequenziale, lasciamo che YOLO usi i default (o quello che trova nell'env)
+        # perché tanto usiamo 1 solo processo.
         model = YOLO(self.model_name)
 
         cap = cv2.VideoCapture(str(video_path))
@@ -69,7 +78,7 @@ class VideoObjectDetection:
             if not ret:
                 break
 
-            # Forza CPU per coerenza con il test parallelo
+            # Forza CPU
             results = model(frame, verbose=False, device='cpu')
 
             for result in results:
@@ -112,12 +121,27 @@ class VideoObjectDetection:
 
     @staticmethod
     def process_video_worker(args):
+        #Riapplichiamo le variabili d'ambiente per sicurezza
+        import os
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+        os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
+        #Importiamo le librerie
+        import torch
+        import cv2
+        try:
+            torch.set_num_threads(1)
+        except RuntimeError:
+            pass
+
+        cv2.setNumThreads(0)
+        from ultralytics import YOLO
+
         video_path, model_name, output_folder, save_output = args
 
-        import torch
-        torch.set_num_threads(1)  # Blocca il parallelismo intra-op di PyTorch
-        torch.set_num_interop_threads(1)  # Blocca il parallelismo inter-op
-        cv2.setNumThreads(0)
         model = YOLO(model_name)
 
         cap = cv2.VideoCapture(str(video_path))
@@ -131,7 +155,6 @@ class VideoObjectDetection:
         out = None
         if save_output:
             output_path = Path(output_folder) / f"par_{Path(video_path).name}"
-            # Usiamo 'mp4v' o 'avc1' a seconda di cosa funziona meglio sul tuo Mac
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
@@ -144,8 +167,7 @@ class VideoObjectDetection:
             if not ret:
                 break
 
-            # Inferenza su CPU (il limite thread imposto sopra la renderà più lenta per singolo frame,
-            # ma permetterà ai processi paralleli di scalare)
+            # Inferenza su CPU
             results = model(frame, verbose=False, device='cpu')
 
             for result in results:
@@ -187,8 +209,6 @@ class VideoObjectDetection:
         ]
 
         start_time = time.time()
-        # Su macOS con 'spawn', gli oggetti passati ai worker devono essere picklable.
-        # YOLO e OpenCV gestiscono questo meglio se reinizializzati nel worker (come fatto sopra).
         with Pool(processes=actual_processes) as pool:
             results = pool.map(self.process_video_worker, worker_args)
         total_time = time.time() - start_time
@@ -208,13 +228,13 @@ class VideoObjectDetection:
             return
 
         # 1. Warm-up
-        print("\n>>>Warm-up...")
+        print("\n>>> Warm-up...")
         if len(video_files) > 0:
             self.process_video_sequential(video_files[0], save_output=False)
         print("Warm-up completato.")
 
         # 2. Baseline Sequenziale
-        print(f"\n>>>Baseline Sequenziale...")
+        print(f"\n>>> Baseline Sequenziale...")
         seq_times = []
         final_seq_results = []
 
@@ -228,12 +248,12 @@ class VideoObjectDetection:
         print(f"   Tempo Medio Sequenziale: {avg_seq_time:.2f}s")
 
         # 3. Test Scalabilità
-        print("\n>>>Test Scalabilità Parallela...")
+        print("\n>>> Test Scalabilità Parallela...")
         max_cores = cpu_count()
 
         core_counts = [2, 4]
         if max_cores > 4:
-            core_counts.append(max_cores)  # Testiamo 8
+            core_counts.append(max_cores)
 
         scaling_results = []
 
@@ -312,13 +332,12 @@ def main():
     try:
         set_start_method('spawn')
     except RuntimeError:
-        pass  # Già settato
+        pass
 
     print("=" * 80)
     print("VIDEO PROCESSING BENCHMARK")
     print("=" * 80)
 
-    # Disabilitato output video per non falsare il test con la velocità SSD
     SAVE_OUTPUT_VIDEOS = False
 
     detector = VideoObjectDetection()
