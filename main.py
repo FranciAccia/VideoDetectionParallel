@@ -1,15 +1,10 @@
 import os
-
-# --- FIX CRITICO PER PARALLELISMO ---
-# Impediamo alle librerie di usare il multithreading interno.
 # Vogliamo che ogni processo usi 1 solo core, così possiamo scalarne N in parallelo.
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
-# ------------------------------------
-
 import cv2
 import time
 import os
@@ -29,7 +24,7 @@ class VideoObjectDetection:
         self.output_folder.mkdir(exist_ok=True)
 
         # Verifica architettura per report
-        print(f"Sistema rilevato: {platform.system()} {platform.machine()} (Apple Silicon M-Series)"
+        print(f"Sistema rilevato: {platform.system()} {platform.machine()}"
               if platform.system() == 'Darwin' and 'arm' in platform.machine()
               else f"Sistema rilevato: {platform.system()} {platform.machine()}")
 
@@ -49,9 +44,6 @@ class VideoObjectDetection:
         return list(video_files)
 
     def process_video_sequential(self, video_path, save_output=False):
-        # Su M2 per il sequenziale potremmo usare 'mps', ma per coerenza
-        # col benchmark parallelo usiamo 'cpu' o lasciamo auto.
-        # Per il benchmark puro CPU vs CPU Parallel, meglio forzare CPU.
         model = YOLO(self.model_name)
 
         cap = cv2.VideoCapture(str(video_path))
@@ -65,7 +57,6 @@ class VideoObjectDetection:
         out = None
         if save_output:
             output_path = self.output_folder / f"seq_{video_path.name}"
-            # Su Mac 'avc1' (H.264) è spesso più compatibile di 'mp4v'
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
@@ -121,12 +112,12 @@ class VideoObjectDetection:
 
     @staticmethod
     def process_video_worker(args):
-        # Unpack degli argomenti
         video_path, model_name, output_folder, save_output = args
 
-        # IMPORTANTE PER M2: Ogni processo deve ricaricare il modello.
-        # Forziamo device='cpu' perché multiprocessing su 'mps' (GPU)
-        # spesso causa crash o contention (rallentamenti) su macOS.
+        import torch
+        torch.set_num_threads(1)  # Blocca il parallelismo intra-op di PyTorch
+        torch.set_num_interop_threads(1)  # Blocca il parallelismo inter-op
+        cv2.setNumThreads(0)
         model = YOLO(model_name)
 
         cap = cv2.VideoCapture(str(video_path))
@@ -140,7 +131,7 @@ class VideoObjectDetection:
         out = None
         if save_output:
             output_path = Path(output_folder) / f"par_{Path(video_path).name}"
-            # Codec H.264 per Mac
+            # Usiamo 'mp4v' o 'avc1' a seconda di cosa funziona meglio sul tuo Mac
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
             out = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
 
@@ -153,7 +144,8 @@ class VideoObjectDetection:
             if not ret:
                 break
 
-            # Inferenza su CPU
+            # Inferenza su CPU (il limite thread imposto sopra la renderà più lenta per singolo frame,
+            # ma permetterà ai processi paralleli di scalare)
             results = model(frame, verbose=False, device='cpu')
 
             for result in results:
@@ -206,24 +198,23 @@ class VideoObjectDetection:
 
     def run_robust_benchmark(self, save_output=False, n_runs=3):
         print("\n" + "=" * 80)
-        print(f"AVVIO BENCHMARK ROBUSTO (MacBook M2 Optimized)")
+        print(f"AVVIO BENCHMARK (MacBook M2 Optimized)")
         print(f"Runs per configurazione: {n_runs}")
         print("=" * 80)
 
         video_files = self.get_video_files()
         if not video_files:
             print("Nessun video trovato nella cartella 'videos'!")
-            print("Crea la cartella e aggiungi dei file .mp4")
             return
 
         # 1. Warm-up
-        print("\n>>> Fase 1: Warm-up...")
+        print("\n>>>Warm-up...")
         if len(video_files) > 0:
             self.process_video_sequential(video_files[0], save_output=False)
         print("Warm-up completato.")
 
         # 2. Baseline Sequenziale
-        print(f"\n>>> Fase 2: Baseline Sequenziale...")
+        print(f"\n>>>Baseline Sequenziale...")
         seq_times = []
         final_seq_results = []
 
@@ -237,10 +228,9 @@ class VideoObjectDetection:
         print(f"   Tempo Medio Sequenziale: {avg_seq_time:.2f}s")
 
         # 3. Test Scalabilità
-        print("\n>>> Fase 3: Test Scalabilità Parallela...")
+        print("\n>>>Test Scalabilità Parallela...")
         max_cores = cpu_count()
 
-        # Su M2 Air hai 8 core (4P + 4E). Testiamo configurazioni significative.
         core_counts = [2, 4]
         if max_cores > 4:
             core_counts.append(max_cores)  # Testiamo 8
@@ -316,22 +306,19 @@ class VideoObjectDetection:
         out_path = self.output_folder / 'm2_scaling_benchmark.png'
         plt.savefig(out_path, dpi=300)
         print(f"\nGrafico salvato in: {out_path}")
-        # plt.show() # Commentato se eseguito headless, scommenta se hai display
 
 
 def main():
-    # CONFIGURAZIONE CRITICA PER MAC OS
-    # 'spawn' è necessario per evitare crash con OpenCV/PyTorch in multiprocessing
     try:
         set_start_method('spawn')
     except RuntimeError:
         pass  # Già settato
 
     print("=" * 80)
-    print("M2 AIR - VIDEO PROCESSING BENCHMARK")
+    print("VIDEO PROCESSING BENCHMARK")
     print("=" * 80)
 
-    # Disabilita output video per non falsare il test con la velocità SSD
+    # Disabilitato output video per non falsare il test con la velocità SSD
     SAVE_OUTPUT_VIDEOS = False
 
     detector = VideoObjectDetection()
