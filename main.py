@@ -255,16 +255,26 @@ class VideoObjectDetection:
 
         if verbose:
             print(f"   [Parallel] Elaborazione {len(video_files)} video con {actual_processes} processi...")
+            print(f"              (Dynamic load balancing: ogni worker prende 1 video alla volta)")
 
-        # Prepara argomenti con worker_id
+        # Prepara argomenti con worker_id (ora worker_id è l'indice del video)
         worker_args = [
             (video_path, self.model_name, self.output_folder, save_output, i)
             for i, video_path in enumerate(video_files)
         ]
 
         start_time = time.time()
+        results = []
         with Pool(processes=actual_processes) as pool:
-            results = pool.map(self.process_video_worker, worker_args)
+            # Usa imap con chunksize=1 per dynamic load balancing
+            completed = 0
+            for result in pool.imap(self.process_video_worker, worker_args, chunksize=1):
+                results.append(result)
+                completed += 1
+                if verbose:
+                    print(f"     Completato {completed}/{len(video_files)} video", end="\r")
+            if verbose:
+                print()  # Newline dopo progress
         total_time = time.time() - start_time
 
         results = [r for r in results if r is not None]
@@ -348,14 +358,7 @@ class VideoObjectDetection:
         print("\n>>> Test Scalabilità Parallela...")
         max_cores = cpu_count()
 
-        # Configurazioni da testare
-        if self.system_info.get('is_m_series', False):
-            core_counts = [2, 4]
-            if max_cores > 4:
-                core_counts.append(max_cores)
-            print(f"   (Architettura M-series rilevata: focus su {self.system_info.get('p_cores', 4)} P-cores)")
-        else:
-            core_counts = [2, 4, max_cores]
+        core_counts = [4]
 
         scaling_results = []
 
@@ -419,38 +422,60 @@ class VideoObjectDetection:
         """Analizza bottleneck basandosi sui risultati"""
         print(f"\n>>> Analisi Bottleneck (configurazione {n_proc} processi):")
 
-        # Analizza distribuzione carico tra worker
-        if 'worker_id' in par_results[0]:
-            worker_times = defaultdict(list)
-            for r in par_results:
-                worker_times[r['worker_id']].append(r['elapsed_time'])
+        # Con dynamic load balancing, non possiamo tracciare esattamente quale worker ha fatto cosa
+        # perché worker_id ora è l'indice del video, non del worker effettivo
+        # Invece analizziamo la distribuzione dei tempi
 
-            print(f"   Distribuzione carico tra worker:")
-            for wid, times in sorted(worker_times.items()):
-                avg_time = np.mean(times) if times else 0
-                print(f"     Worker {wid}: {avg_time:.2f}s ({len(times)} video)")
+        print(f"   Distribuzione tempi elaborazione video:")
+        video_times = [(r['video_name'], r['elapsed_time']) for r in par_results]
+        video_times.sort(key=lambda x: x[1], reverse=True)
 
-            # Calcola load imbalance
-            all_times = [np.mean(times) for times in worker_times.values() if times]
-            if all_times:
-                max_time = max(all_times)
-                min_time = min(all_times)
-                imbalance = ((max_time - min_time) / max_time * 100) if max_time > 0 else 0
-                print(f"   Load Imbalance: {imbalance:.1f}%")
+        for i, (name, time) in enumerate(video_times[:5]):  # Top 5 più lunghi
+            print(f"     {i + 1}. {name[:30]:30s}: {time:6.2f}s")
 
-                if imbalance > 20:
-                    print(f"   ⚠ Alto sbilanciamento del carico - considerare strategie di distribuzione dinamica")
+        if len(video_times) > 5:
+            print(f"     ... (altri {len(video_times) - 5} video)")
+
+        # Calcola statistiche distribuzione
+        times = [t for _, t in video_times]
+        avg_time = np.mean(times)
+        max_time = max(times)
+        min_time = min(times)
+
+        print(f"\n   Statistiche tempi video:")
+        print(f"     Media: {avg_time:.2f}s")
+        print(f"     Min: {min_time:.2f}s | Max: {max_time:.2f}s")
+        print(f"     Range: {max_time - min_time:.2f}s")
+
+        # Con load balancing dinamico, il tempo totale parallelo dovrebbe essere circa:
+        # total_work / n_workers
+        total_work = sum(times)
+        theoretical_parallel = total_work / n_proc
+        actual_parallel = max(times)  # Approssimazione: il video più lungo determina il tempo
+
+        print(f"\n   Analisi load balancing:")
+        print(f"     Lavoro totale: {total_work:.2f}s")
+        print(f"     Teorico (work/workers): {theoretical_parallel:.2f}s")
+        print(f"     Effettivo (video più lungo): {actual_parallel:.2f}s")
+        print(f"     Efficienza load balancing: {theoretical_parallel / actual_parallel * 100:.1f}%")
 
         # Stima overhead parallelizzazione
         seq_total = sum(r['elapsed_time'] for r in seq_results)
-        par_total_work = sum(r['elapsed_time'] for r in par_results)
 
-        print(f"\n   Tempo lavoro utile sequenziale: {seq_total:.2f}s")
-        print(f"   Tempo lavoro utile parallelo: {par_total_work:.2f}s")
+        print(f"\n   Confronto lavoro sequenziale vs parallelo:")
+        print(f"     Tempo lavoro sequenziale: {seq_total:.2f}s")
+        print(f"     Tempo lavoro parallelo (somma): {total_work:.2f}s")
 
-        overhead = par_total_work - seq_total
-        if overhead > 0:
-            print(f"   Overhead stimato: {overhead:.2f}s ({overhead / par_total_work * 100:.1f}% del tempo parallelo)")
+        overhead = total_work - seq_total
+        if abs(overhead) > 1.0:  # Soglia di 1s per considerare overhead significativo
+            overhead_pct = abs(overhead) / seq_total * 100
+            if overhead > 0:
+                print(f"     Overhead parallelizzazione: +{overhead:.2f}s (+{overhead_pct:.1f}%)")
+                print(f"     ⚠ Overhead positivo indica caricamento modelli e context switching")
+            else:
+                print(f"     Efficienza: {overhead:.2f}s ({overhead_pct:.1f}% più efficiente)")
+        else:
+            print(f"     ✓ Overhead trascurabile ({overhead:.2f}s)")
 
     def plot_comprehensive_analysis(self, seq_time, scaling_data, seq_results, par_results):
         """Genera grafici completi per l'analisi"""
